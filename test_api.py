@@ -12,7 +12,7 @@ class TestAppAPI(unittest.TestCase):
     def test_index_page(self):
         response = self.client.get('/')
         self.assertEqual(response.status_code, 200)
-        self.assertIn('Список участников'.encode('utf-8'), response.data)
+        self.assertIn('Очередь'.encode('utf-8'), response.data)
         self.assertIn('nameInput'.encode('utf-8'), response.data)
         self.assertIn('namesList'.encode('utf-8'), response.data)
 
