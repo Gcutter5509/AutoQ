@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Список имён</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="page-container">
+        <main class="card">
+            <!-- Header Section -->
+            <header class="card-header">
+                <div class="badge-schedule">
+                    <span class="icon">🕒</span>
+                    <span>Очистка: Пн, Ср, Пт в 14:00 (UTC+5)</span>
+                </div>
+                <h1 class="title">Список участников</h1>
+                <p class="subtitle" id="nextCleanupBox">
+                    Следующее обнуление: <strong id="nextCleanupText">—</strong>
+                </p>
+            </header>
+
+            <!-- Object 1: Input Field & Submit Button -->
+            <section class="input-section">
+                <form id="nameForm" class="name-form" autocomplete="off">
+                    <div class="input-group">
+                        <input 
+                            type="text" 
+                            id="nameInput" 
+                            name="name" 
+                            placeholder="Введите ваше имя..." 
+                            maxlength="100" 
+                            required
+                            autofocus
+                        >
+                        <button type="submit" id="submitBtn" class="btn btn-primary">
+                            <span class="btn-text">Добавить</span>
+                            <span class="btn-spinner hidden"></span>
+                        </button>
+                    </div>
+                    <div id="formFeedback" class="feedback hidden"></div>
+                </form>
+            </section>
+
+            <!-- Divider -->
+            <hr class="divider">
+
+            <!-- Object 2: List of Entered Names -->
+            <section class="list-section">
+                <div class="list-header">
+                    <h2 class="list-title">Введённые имена</h2>
+                    <span id="namesCountBadge" class="count-badge">0</span>
+                </div>
+
+                <!-- Empty State -->
+                <div id="emptyState" class="empty-state">
+                    <div class="empty-icon">📝</div>
+                    <p class="empty-title">Список пока пуст</p>
+                    <p class="empty-desc">Введите своё имя выше, чтобы стать первым в списке!</p>
+                </div>
+
+                <!-- Ordered List of Names -->
+                <ol id="namesList" class="names-list hidden"></ol>
+            </section>
+
+            <!-- Footer status -->
+            <footer class="card-footer">
+                <div class="live-status">
+                    <span class="status-dot"></span>
+                    <span id="statusText">Автообновление каждые 2 сек</span>
+                </div>
+                <div class="server-time">
+                    <span id="serverTimeText"></span>
+                </div>
+            </footer>
+        </main>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
