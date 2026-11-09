@@ -1,0 +1,16 @@
+{
+  "name": "autoq",
+  "version": "1.0.0",
+  "description": "AutoQ online queue system",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "node-cron": "^4.6.0"
+  }
+}
