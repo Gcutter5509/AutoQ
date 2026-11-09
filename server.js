@@ -18,8 +18,9 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/static', express.static(path.join(__dirname, 'static')));
 
 // Database connection (Turso cloud or local sqlite file fallback)
-const dbUrl = process.env.TURSO_DATABASE_URL || 'file:names.db';
-const authToken = process.env.TURSO_AUTH_TOKEN || undefined;
+const dbUrl = (process.env.TURSO_DATABASE_URL || 'libsql://autoq-gcutter5509.aws-eu-north-1.turso.io').trim();
+const authToken = (process.env.TURSO_AUTH_TOKEN || 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTQxOTczNTUsImlkIjoiMDFhMWJlN2QtM2UwMS03NDEzLWE5ZGYtZGM5MDk3YWVhZWE5Iiwia2lkIjoiZ1BxM01OS2NpV0lSdVI4cXBfU3FZUjNlM001QXFOaHI2bVdzbnJzQXNpWSIsInJpZCI6ImIwNzRlYjAyLTE2NGUtNDdiMi1hMGQ2LTliYTIxZTgyYjc5MiJ9.Rltiv16QtTohQ4kF2LYoYs6DmcFl95Qoh4TUmcIRR4wrqtKdXshe3uWujWCDuqjQY4d5KMH3f6rB9tTBB_VpAQ').trim();
+const isCloudTurso = !dbUrl.startsWith('file:');
 
 const db = createClient({
   url: dbUrl,
@@ -95,22 +96,16 @@ async function performCleanupIfDue() {
       sql: "SELECT value FROM system_meta WHERE key = 'last_cleanup_slot'",
       args: []
     });
-    const lastSlot = res.rows.length > 0 ? String(res.rows[0].value) : '';
+    const lastSlot = res.rows.length > 0 ? String(res.rows[0].value ?? res.rows[0][0] ?? '') : '';
 
-    if (lastSlot < slotStr) {
-      await db.batch([
-        { sql: 'DELETE FROM names', args: [] },
-        { sql: "DELETE FROM sqlite_sequence WHERE name = 'names'", args: [] },
-        { sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('last_cleanup_slot', ?)", args: [slotStr] },
-        { sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('last_cleanup_time', ?)", args: [nowUtc5.toISOString()] }
-      ]);
-      console.log(`[${formatRuDate(nowUtc5)}] 🧹 Database cleared according to schedule (slot: ${slotStr})`);
-      return true;
-    }
-  } catch (err) {
-    // If sqlite_sequence doesn't exist yet, delete names and update slot individually
-    try {
+    if (lastSlot && lastSlot < slotStr) {
+      console.log(`[${formatRuDate(nowUtc5)}] 🧹 Database cleared according to schedule (slot: ${slotStr}, prev: ${lastSlot})`);
       await db.execute('DELETE FROM names');
+      try {
+        await db.execute("DELETE FROM sqlite_sequence WHERE name = 'names'");
+      } catch {
+        // sqlite_sequence may not exist yet, safe to ignore
+      }
       await db.execute({
         sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('last_cleanup_slot', ?)",
         args: [slotStr]
@@ -119,11 +114,16 @@ async function performCleanupIfDue() {
         sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('last_cleanup_time', ?)",
         args: [nowUtc5.toISOString()]
       });
-      console.log(`[${formatRuDate(nowUtc5)}] 🧹 Database cleared according to schedule (fallback slot: ${slotStr})`);
       return true;
-    } catch (fallbackErr) {
-      console.error('Error during cleanup:', fallbackErr.message);
+    } else if (!lastSlot) {
+      // First run or missing slot metadata: record current slot without deleting data!
+      await db.execute({
+        sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('last_cleanup_slot', ?)",
+        args: [slotStr]
+      });
     }
+  } catch (err) {
+    console.error('Scheduled cleanup check error:', err.message);
   }
   return false;
 }
@@ -249,20 +249,20 @@ app.post('/api/names', async (req, res) => {
 app.post('/api/admin/clear', async (req, res) => {
   const nowUtc5 = getUtc5Date();
   try {
-    await db.batch([
-      { sql: 'DELETE FROM names', args: [] },
-      { sql: "DELETE FROM sqlite_sequence WHERE name = 'names'", args: [] },
-      { sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('manual_cleanup_time', ?)", args: [nowUtc5.toISOString()] }
-    ]);
+    await db.execute('DELETE FROM names');
+    try {
+      await db.execute("DELETE FROM sqlite_sequence WHERE name = 'names'");
+    } catch {
+      // sqlite_sequence may not exist yet, safe to ignore
+    }
+    await db.execute({
+      sql: "INSERT OR REPLACE INTO system_meta (key, value) VALUES ('manual_cleanup_time', ?)",
+      args: [nowUtc5.toISOString()]
+    });
     res.json({ success: true, message: 'Список успешно очищен вручную' });
   } catch (err) {
-    try {
-      await db.execute('DELETE FROM names');
-      res.json({ success: true, message: 'Список успешно очищен вручную' });
-    } catch (fallbackErr) {
-      console.error('Manual clear error:', fallbackErr);
-      res.status(500).json({ success: false, error: fallbackErr.message });
-    }
+    console.error('Manual clear error:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -290,14 +290,22 @@ initDb()
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       const nowUtc5 = getUtc5Date();
-      console.log('='.repeat(50));
+      console.log('='.repeat(55));
       console.log(`🚀 Сервер очереди AutoQ запущен на порту ${PORT}!`);
+      if (isCloudTurso) {
+        console.log(`✅ База данных: Turso Cloud (${dbUrl})`);
+      } else {
+        console.warn(`⚠️ ВНИМАНИЕ: Переменная TURSO_DATABASE_URL не найдена!`);
+        console.warn(`   Сервер работает с локальным файлом: ${dbUrl}`);
+        console.warn(`   В облаке (Render/Railway) при 'засыпании' сайта данные будут СТЁРТЫ!`);
+        console.warn(`   Укажите TURSO_DATABASE_URL и TURSO_AUTH_TOKEN в настройках хостинга.`);
+      }
       console.log(`🕒 Текущее серверное время: ${nowUtc5.toISOString().replace('T', ' ').slice(0, 19)} (UTC+5)`);
       console.log(`🧹 Следующая автоочистка: ${formatRuDate(getNextCleanupSlot(nowUtc5))}`);
       console.log(`🌐 Локальный адрес: http://127.0.0.1:${PORT}`);
-      console.log('='.repeat(50));
+      console.log('='.repeat(55));
     });
   })
   .catch(err => {
-    console.error('Ошибка инициализации базы данных:', err);
+    console.error('❌ Ошибка инициализации базы данных:', err);
   });

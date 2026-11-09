@@ -31,9 +31,13 @@ docker compose up -d
 ### Облачный деплой (Render / Railway)
 В проекте подготовлен `Procfile`:
 ```
-web: gunicorn --workers 1 --threads 4 app:app
+web: node server.js
 ```
-При подключении репозитория сервис развернётся автоматически.
+
+**Обязательные переменные окружения в панели хостинга (Environment Variables):**
+- `TURSO_DATABASE_URL` — ссылка на базу данных Turso (например, `libsql://your-db-username.turso.io`)
+- `TURSO_AUTH_TOKEN` — токен авторизации Turso
+- `PORT` — обычно назначается платформой автоматически
 
 ## 🧪 Тестирование
 
