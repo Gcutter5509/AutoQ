@@ -18,6 +18,61 @@
     let lastDataFingerprint = '';
     let isSubmitting = false;
 
+    const RU_MONTHS = [
+        'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+        'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
+    ];
+
+    // Format date and time for entry display (e.g. "9 ноября" and "19:23:20")
+    function formatEntryDateTime(createdAt) {
+        if (!createdAt || typeof createdAt !== 'string') {
+            return { date: '', time: '', full: '' };
+        }
+
+        const trimmed = createdAt.trim();
+
+        // Case 1: "DD.MM.YYYY HH:MM:SS" or "DD.MM.YYYY HH:MM"
+        const spaceIdx = trimmed.indexOf(' ');
+        if (spaceIdx !== -1) {
+            const datePart = trimmed.slice(0, spaceIdx);
+            const timePart = trimmed.slice(spaceIdx + 1);
+            const dateSubParts = datePart.split('.');
+            if (dateSubParts.length === 3) {
+                const day = parseInt(dateSubParts[0], 10);
+                const monthIdx = parseInt(dateSubParts[1], 10) - 1;
+                if (!isNaN(day) && monthIdx >= 0 && monthIdx < 12) {
+                    return {
+                        date: `${day} ${RU_MONTHS[monthIdx]}`,
+                        time: timePart,
+                        full: trimmed
+                    };
+                }
+            }
+        }
+
+        // Case 2: ISO string or Date-parseable string
+        const parsedDate = new Date(trimmed);
+        if (!isNaN(parsedDate.getTime())) {
+            const day = parsedDate.getDate();
+            const monthIdx = parsedDate.getMonth();
+            const hh = String(parsedDate.getHours()).padStart(2, '0');
+            const mm = String(parsedDate.getMinutes()).padStart(2, '0');
+            const ss = String(parsedDate.getSeconds()).padStart(2, '0');
+            return {
+                date: `${day} ${RU_MONTHS[monthIdx]}`,
+                time: `${hh}:${mm}:${ss}`,
+                full: trimmed
+            };
+        }
+
+        // Fallback: return as-is
+        return {
+            date: '',
+            time: trimmed,
+            full: trimmed
+        };
+    }
+
     // Show feedback message (error / success)
     function showFeedback(message, type = 'error') {
         formFeedback.textContent = message;
@@ -84,15 +139,27 @@
             leftDiv.appendChild(rankBadge);
             leftDiv.appendChild(nameSpan);
 
-            const timeSpan = document.createElement('span');
-            timeSpan.className = 'name-time';
-            // Extract time portion if created_at is in 'DD.MM.YYYY HH:MM:SS' format
-            const timeParts = item.created_at ? item.created_at.split(' ') : [];
-            timeSpan.textContent = timeParts.length > 1 ? timeParts[1] : item.created_at;
-            timeSpan.title = item.created_at || '';
+            const timeDiv = document.createElement('div');
+            timeDiv.className = 'name-time';
+            timeDiv.title = `Запись создана: ${item.created_at || ''}`;
+
+            const dt = formatEntryDateTime(item.created_at);
+            if (dt.date) {
+                const dateSpan = document.createElement('span');
+                dateSpan.className = 'time-date';
+                dateSpan.textContent = dt.date;
+                timeDiv.appendChild(dateSpan);
+            }
+
+            if (dt.time) {
+                const clockSpan = document.createElement('span');
+                clockSpan.className = 'time-clock';
+                clockSpan.textContent = dt.time;
+                timeDiv.appendChild(clockSpan);
+            }
 
             li.appendChild(leftDiv);
-            li.appendChild(timeSpan);
+            li.appendChild(timeDiv);
 
             namesList.appendChild(li);
         });

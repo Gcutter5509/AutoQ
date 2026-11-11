@@ -305,6 +305,7 @@ body {
     align-items: center;
     gap: 12px;
     min-width: 0;
+    flex: 1;
 }
 
 .rank-badge {
@@ -329,10 +330,29 @@ body {
 }
 
 .name-time {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: center;
     font-size: 0.78rem;
     color: var(--text-muted);
     flex-shrink: 0;
     margin-left: 12px;
+    line-height: 1.25;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.name-time .time-date {
+    font-weight: 600;
+    font-size: 0.78rem;
+    color: var(--text-main);
+    letter-spacing: -0.01em;
+}
+
+.name-time .time-clock {
+    font-size: 0.72rem;
+    color: var(--text-muted);
 }
 
 /* Footer */

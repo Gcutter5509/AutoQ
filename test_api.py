@@ -40,6 +40,8 @@ class TestAppAPI(unittest.TestCase):
         self.assertTrue(data['success'])
         self.assertEqual(data['item']['name'], 'Алексей')
         self.assertEqual(data['item']['id'], 1)
+        self.assertIn('created_at', data['item'])
+        self.assertRegex(data['item']['created_at'], r'^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}$')
 
         # 4. Add second name
         res = self.client.post('/api/names', 
@@ -48,6 +50,7 @@ class TestAppAPI(unittest.TestCase):
         self.assertEqual(res.status_code, 201)
         data = res.get_json()
         self.assertEqual(data['item']['id'], 2)
+        self.assertIn('created_at', data['item'])
 
         # 5. Check order: Алексей should be first, Мария second
         res = self.client.get('/api/names')
@@ -55,8 +58,12 @@ class TestAppAPI(unittest.TestCase):
         self.assertEqual(data['count'], 2)
         self.assertEqual(data['names'][0]['name'], 'Алексей')
         self.assertEqual(data['names'][0]['id'], 1)
+        self.assertIn('created_at', data['names'][0])
+        self.assertRegex(data['names'][0]['created_at'], r'^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}$')
         self.assertEqual(data['names'][1]['name'], 'Мария')
         self.assertEqual(data['names'][1]['id'], 2)
+        self.assertIn('created_at', data['names'][1])
+        self.assertRegex(data['names'][1]['created_at'], r'^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}$')
 
         # 6. Test validation (empty name)
         res = self.client.post('/api/names', 
