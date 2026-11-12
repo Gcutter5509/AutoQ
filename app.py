@@ -51,13 +51,17 @@ def init_db():
                 # If table exists but lacks slot or device_id, drop and recreate
                 if cols and ('slot' not in cols or 'device_id' not in cols):
                     conn.execute("DROP TABLE names")
+                    cols = []
+                elif cols and 'ip_address' not in cols:
+                    conn.execute("ALTER TABLE names ADD COLUMN ip_address TEXT DEFAULT ''")
                 
                 conn.execute('''
                     CREATE TABLE IF NOT EXISTS names (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         slot INTEGER NOT NULL UNIQUE CHECK(slot >= 1 AND slot <= 15),
                         name TEXT NOT NULL,
-                        device_id TEXT NOT NULL UNIQUE,
+                        device_id TEXT NOT NULL,
+                        ip_address TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL
                     )
                 ''')
@@ -150,6 +154,19 @@ def get_device_id():
         ''
     ).strip()
 
+def get_client_ip():
+    """Extract real client IP address considering proxy headers."""
+    xff = request.headers.get('X-Forwarded-For')
+    if xff:
+        # First IP in list is the actual client IP
+        ip = xff.split(',')[0].strip()
+        if ip:
+            return ip
+    ip = request.headers.get('CF-Connecting-IP') or request.headers.get('X-Real-IP')
+    if ip:
+        return ip.strip()
+    return (request.remote_addr or '127.0.0.1').strip()
+
 @app.before_request
 def before_request_hook():
     """Ensure cleanup is up-to-date on every request."""
@@ -164,17 +181,22 @@ def get_names():
     now = datetime.now(UTC5)
     next_slot = get_next_cleanup_slot(now)
     device_id = get_device_id()
+    client_ip = get_client_ip()
     
     with db_lock:
         conn = get_db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT id, slot, name, device_id, created_at FROM names ORDER BY slot ASC")
+            cur.execute("SELECT id, slot, name, device_id, ip_address, created_at FROM names ORDER BY slot ASC")
             rows = cur.fetchall()
             names_list = []
             user_booking = None
             for row in rows:
-                is_mine = bool(device_id and row["device_id"] == device_id)
+                row_ip = row["ip_address"] if "ip_address" in row.keys() else ""
+                is_mine = bool(
+                    (device_id and row["device_id"] == device_id) or
+                    (client_ip and row_ip and row_ip == client_ip)
+                )
                 item = {
                     "id": row["id"],
                     "slot": row["slot"],
@@ -183,7 +205,7 @@ def get_names():
                     "is_mine": is_mine
                 }
                 names_list.append(item)
-                if is_mine:
+                if is_mine and not user_booking:
                     user_booking = {
                         "id": row["id"],
                         "slot": row["slot"],
@@ -199,6 +221,7 @@ def get_names():
         "max_slots": 15,
         "names": names_list,
         "user_booking": user_booking,
+        "client_ip": client_ip,
         "server_time": now.strftime('%Y-%m-%d %H:%M:%S (UTC+5)'),
         "next_cleanup": {
             "iso": next_slot.isoformat(),
@@ -213,9 +236,12 @@ def add_name():
     name = (data.get('name') or '').strip()
     slot_raw = data.get('slot')
     device_id = (data.get('deviceId') or request.headers.get('X-Device-Id') or request.cookies.get('autoq_device_id') or '').strip()
+    client_ip = get_client_ip()
     
     if not name:
         return jsonify({"success": False, "error": "Имя не может быть пустым"}), 400
+    if len(name) < 2:
+        return jsonify({"success": False, "error": "Имя должно содержать минимум 2 символа (введите имя или фамилию)"}), 400
     if len(name) > 100:
         return jsonify({"success": False, "error": "Имя слишком длинное (максимум 100 символов)"}), 400
         
@@ -240,16 +266,26 @@ def add_name():
         try:
             with conn:
                 cur = conn.cursor()
-                # 1. Device check: only one spot per device
+                # 1. IP check: strictly 1 spot per IP address
+                if client_ip:
+                    cur.execute("SELECT slot, name FROM names WHERE ip_address = ?", (client_ip,))
+                    existing_ip = cur.fetchone()
+                    if existing_ip:
+                        return jsonify({
+                            "success": False,
+                            "error": f"С вашего IP-адреса ({client_ip}) уже забронировано место №{existing_ip['slot']} ({existing_ip['name']}). С одного IP разрешено занять только 1 место!"
+                        }), 409
+
+                # 2. Device check: strictly 1 spot per device
                 cur.execute("SELECT slot, name FROM names WHERE device_id = ?", (device_id,))
                 existing_dev = cur.fetchone()
                 if existing_dev:
                     return jsonify({
                         "success": False,
-                        "error": f"С вашего устройства уже забронировано место №{existing_dev['slot']} ({existing_dev['name']}). Одно устройство может занять только одно место!"
+                        "error": f"С вашего устройства уже забронировано место №{existing_dev['slot']} ({existing_dev['name']}). Одно устройство может занять только 1 место!"
                     }), 409
 
-                # 2. Slot check: is this slot available?
+                # 3. Slot check: is this slot available?
                 cur.execute("SELECT name FROM names WHERE slot = ?", (slot,))
                 existing_slot = cur.fetchone()
                 if existing_slot:
@@ -258,11 +294,11 @@ def add_name():
                         "error": f"Место №{slot} уже занято ({existing_slot['name']}). Пожалуйста, выберите другое свободное место."
                     }), 409
 
-                # 3. Insert new booking
+                # 4. Insert new booking
                 try:
                     cur.execute(
-                        "INSERT INTO names (slot, name, device_id, created_at) VALUES (?, ?, ?, ?)",
-                        (slot, name, device_id, created_at_str)
+                        "INSERT INTO names (slot, name, device_id, ip_address, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (slot, name, device_id, client_ip, created_at_str)
                     )
                     inserted_id = cur.lastrowid
                 except sqlite3.IntegrityError:
@@ -288,22 +324,24 @@ def add_name():
 def cancel_booking():
     data = request.get_json(silent=True) or request.form
     device_id = (data.get('deviceId') or request.headers.get('X-Device-Id') or request.cookies.get('autoq_device_id') or '').strip()
-
-    if not device_id:
-        return jsonify({"success": False, "error": "Не передан идентификатор устройства"}), 400
+    client_ip = get_client_ip()
 
     with db_lock:
         conn = get_db()
         try:
             with conn:
                 cur = conn.cursor()
-                cur.execute("SELECT slot, name FROM names WHERE device_id = ?", (device_id,))
+                # Match either by device_id or by client_ip
+                cur.execute(
+                    "SELECT id, slot, name FROM names WHERE (device_id != '' AND device_id = ?) OR (ip_address != '' AND ip_address = ?)",
+                    (device_id, client_ip)
+                )
                 row = cur.fetchone()
                 if not row:
                     return jsonify({"success": False, "error": "У вас нет активной записи в очереди"}), 404
                 
                 slot_freed = row["slot"]
-                conn.execute("DELETE FROM names WHERE device_id = ?", (device_id,))
+                conn.execute("DELETE FROM names WHERE id = ?", (row["id"],))
         finally:
             conn.close()
 

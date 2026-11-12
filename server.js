@@ -11,6 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -138,6 +139,20 @@ function getDeviceId(req) {
   ).trim();
 }
 
+// Helper to extract real client IP address
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    const first = xff.split(',')[0].trim();
+    if (first) return first;
+  }
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf) return String(cf).trim();
+  const xReal = req.headers['x-real-ip'];
+  if (xReal) return String(xReal).trim();
+  return String(req.ip || req.socket?.remoteAddress || '127.0.0.1').trim();
+}
+
 // Initialize tables and metadata
 async function initDb() {
   try {
@@ -145,6 +160,8 @@ async function initDb() {
     const cols = tableInfo.rows.map(r => String(r.name ?? r[1] ?? ''));
     if (cols.length > 0 && (!cols.includes('slot') || !cols.includes('device_id'))) {
       await db.execute("DROP TABLE names");
+    } else if (cols.length > 0 && !cols.includes('ip_address')) {
+      await db.execute("ALTER TABLE names ADD COLUMN ip_address TEXT DEFAULT ''");
     }
   } catch {
     // Table may not exist yet, ignore
@@ -155,10 +172,16 @@ async function initDb() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       slot INTEGER NOT NULL UNIQUE CHECK(slot >= 1 AND slot <= 15),
       name TEXT NOT NULL,
-      device_id TEXT NOT NULL UNIQUE,
+      device_id TEXT NOT NULL,
+      ip_address TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
   `);
+
+  // Remove any spam entries with length < 2
+  try {
+    await db.execute("DELETE FROM names WHERE LENGTH(TRIM(name)) < 2");
+  } catch {}
 
   await db.execute(`
     CREATE TABLE IF NOT EXISTS system_meta (
@@ -194,12 +217,17 @@ app.get('/api/names', async (req, res) => {
     const nowUtc5 = getUtc5Date();
     const nextSlot = getNextCleanupSlot(nowUtc5);
     const deviceId = getDeviceId(req);
+    const clientIp = getClientIp(req);
 
-    const result = await db.execute('SELECT id, slot, name, device_id, created_at FROM names ORDER BY slot ASC');
+    const result = await db.execute('SELECT id, slot, name, device_id, ip_address, created_at FROM names ORDER BY slot ASC');
     let userBooking = null;
     const names = result.rows.map(row => {
       const rowDeviceId = String(row.device_id ?? '');
-      const isMine = Boolean(deviceId && rowDeviceId === deviceId);
+      const rowIp = String(row.ip_address ?? '');
+      const isMine = Boolean(
+        (deviceId && rowDeviceId === deviceId) ||
+        (clientIp && rowIp && rowIp === clientIp)
+      );
       const item = {
         id: Number(row.id),
         slot: Number(row.slot),
@@ -207,7 +235,7 @@ app.get('/api/names', async (req, res) => {
         created_at: String(row.created_at),
         is_mine: isMine
       };
-      if (isMine) {
+      if (isMine && !userBooking) {
         userBooking = {
           id: item.id,
           slot: item.slot,
@@ -232,6 +260,7 @@ app.get('/api/names', async (req, res) => {
       max_slots: 15,
       names: names,
       user_booking: userBooking,
+      client_ip: clientIp,
       server_time: serverTime,
       next_cleanup: {
         iso: nextSlot.toISOString(),
@@ -249,9 +278,13 @@ app.post('/api/names', async (req, res) => {
   const name = (req.body?.name || '').trim();
   const slotRaw = req.body?.slot;
   const deviceId = getDeviceId(req);
+  const clientIp = getClientIp(req);
 
   if (!name) {
     return res.status(400).json({ success: false, error: 'Имя не может быть пустым' });
+  }
+  if (name.length < 2) {
+    return res.status(400).json({ success: false, error: 'Имя должно содержать минимум 2 символа (введите имя или фамилию)' });
   }
   if (name.length > 100) {
     return res.status(400).json({ success: false, error: 'Имя слишком длинное (максимум 100 символов)' });
@@ -280,7 +313,23 @@ app.post('/api/names', async (req, res) => {
   const createdAtStr = `${dd}.${mm}.${yyyy} ${hh}:${min}:${ss}`;
 
   try {
-    // 1. Device check
+    // 1. IP check: strictly 1 spot per IP address
+    if (clientIp) {
+      const existingIp = await db.execute({
+        sql: 'SELECT slot, name FROM names WHERE ip_address = ?',
+        args: [clientIp]
+      });
+      if (existingIp.rows.length > 0) {
+        const ipSlot = existingIp.rows[0].slot ?? existingIp.rows[0][0];
+        const ipName = existingIp.rows[0].name ?? existingIp.rows[0][1];
+        return res.status(409).json({
+          success: false,
+          error: `С вашего IP-адреса (${clientIp}) уже забронировано место №${ipSlot} (${ipName}). С одного IP разрешено занять только 1 место!`
+        });
+      }
+    }
+
+    // 2. Device check
     const existingDev = await db.execute({
       sql: 'SELECT slot, name FROM names WHERE device_id = ?',
       args: [deviceId]
@@ -294,7 +343,7 @@ app.post('/api/names', async (req, res) => {
       });
     }
 
-    // 2. Slot check
+    // 3. Slot check
     const existingSlot = await db.execute({
       sql: 'SELECT name FROM names WHERE slot = ?',
       args: [slot]
@@ -307,10 +356,10 @@ app.post('/api/names', async (req, res) => {
       });
     }
 
-    // 3. Insert
+    // 4. Insert
     const result = await db.execute({
-      sql: 'INSERT INTO names (slot, name, device_id, created_at) VALUES (?, ?, ?, ?)',
-      args: [slot, name, deviceId, createdAtStr]
+      sql: 'INSERT INTO names (slot, name, device_id, ip_address, created_at) VALUES (?, ?, ?, ?, ?)',
+      args: [slot, name, deviceId, clientIp, createdAtStr]
     });
 
     const insertedId = result.lastInsertRowid !== undefined ? Number(result.lastInsertRowid) : null;
@@ -337,23 +386,22 @@ app.post('/api/names', async (req, res) => {
 // 3. Cancel own booking endpoint
 app.post('/api/names/cancel', async (req, res) => {
   const deviceId = getDeviceId(req);
-  if (!deviceId) {
-    return res.status(400).json({ success: false, error: 'Не передан идентификатор устройства' });
-  }
+  const clientIp = getClientIp(req);
 
   try {
     const existing = await db.execute({
-      sql: 'SELECT slot, name FROM names WHERE device_id = ?',
-      args: [deviceId]
+      sql: 'SELECT id, slot, name FROM names WHERE (device_id != "" AND device_id = ?) OR (ip_address != "" AND ip_address = ?)',
+      args: [deviceId, clientIp]
     });
     if (existing.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'У вас нет активной записи в очереди' });
     }
 
     const slotFreed = existing.rows[0].slot ?? existing.rows[0][0];
+    const rowId = existing.rows[0].id ?? existing.rows[0][0];
     await db.execute({
-      sql: 'DELETE FROM names WHERE device_id = ?',
-      args: [deviceId]
+      sql: 'DELETE FROM names WHERE id = ?',
+      args: [rowId]
     });
 
     res.json({

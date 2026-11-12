@@ -277,6 +277,12 @@
             return;
         }
 
+        if (name.length < 2) {
+            showFeedback('Имя должно содержать минимум 2 символа!', 'error');
+            shakeInput();
+            return;
+        }
+
         if (name.length > 100) {
             showFeedback('Имя слишком длинное (максимум 100 символов)', 'error');
             shakeInput();

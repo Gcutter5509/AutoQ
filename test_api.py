@@ -23,7 +23,7 @@ class TestAppAPI(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
 
         # 2. Get list (should be empty, max_slots = 15)
-        res = self.client.get('/api/names', headers={'X-Device-Id': 'dev-1'})
+        res = self.client.get('/api/names', headers={'X-Device-Id': 'dev-1', 'X-Forwarded-For': '10.0.0.1'})
         self.assertEqual(res.status_code, 200)
         data = res.get_json()
         self.assertTrue(data['success'])
@@ -34,8 +34,9 @@ class TestAppAPI(unittest.TestCase):
         self.assertIn('next_cleanup', data)
         self.assertIn('formatted', data['next_cleanup'])
 
-        # 3. Add first person to slot 5 (Device 1)
+        # 3. Add first person to slot 5 (Device 1, IP 10.0.0.1)
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.1'},
                                data=json.dumps({'name': 'Алексей', 'slot': 5, 'deviceId': 'dev-1'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 201)
@@ -46,8 +47,9 @@ class TestAppAPI(unittest.TestCase):
         self.assertIn('created_at', data['item'])
         self.assertRegex(data['item']['created_at'], r'^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}$')
 
-        # 4. Device restriction test: Device 1 tries to book a SECOND slot (e.g. slot 6)
+        # 4. Device restriction test: Device 1 tries to book a SECOND slot (different IP or same IP)
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.99'},
                                data=json.dumps({'name': 'Алексей Повторно', 'slot': 6, 'deviceId': 'dev-1'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 409)
@@ -55,8 +57,19 @@ class TestAppAPI(unittest.TestCase):
         self.assertFalse(data['success'])
         self.assertIn('уже забронировано место', data['error'])
 
-        # 5. Slot conflict test: Device 2 tries to take ALREADY TAKEN slot 5
+        # 5. IP restriction test: Spammer clears deviceId / incognito (new deviceId "dev-spammer"), but SAME IP 10.0.0.1!
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.1'},
+                               data=json.dumps({'name': 'Спамер', 'slot': 6, 'deviceId': 'dev-spammer'}), 
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 409)
+        data = res.get_json()
+        self.assertFalse(data['success'])
+        self.assertIn('С вашего IP-адреса', data['error'])
+
+        # 6. Slot conflict test: Device 2 (IP 10.0.0.2) tries to take ALREADY TAKEN slot 5
+        res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.2'},
                                data=json.dumps({'name': 'Мария', 'slot': 5, 'deviceId': 'dev-2'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 409)
@@ -64,8 +77,9 @@ class TestAppAPI(unittest.TestCase):
         self.assertFalse(data['success'])
         self.assertIn('уже занято', data['error'])
 
-        # 6. Device 2 books free slot 2
+        # 7. Device 2 (IP 10.0.0.2) books free slot 2
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.2'},
                                data=json.dumps({'name': 'Мария', 'slot': 2, 'deviceId': 'dev-2'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 201)
@@ -73,8 +87,8 @@ class TestAppAPI(unittest.TestCase):
         self.assertEqual(data['item']['slot'], 2)
         self.assertEqual(data['item']['name'], 'Мария')
 
-        # 7. Check ordering: Slot 2 (Мария) must come BEFORE Slot 5 (Алексей)
-        res = self.client.get('/api/names', headers={'X-Device-Id': 'dev-2'})
+        # 8. Check ordering: Slot 2 (Мария) must come BEFORE Slot 5 (Алексей)
+        res = self.client.get('/api/names', headers={'X-Device-Id': 'dev-2', 'X-Forwarded-For': '10.0.0.2'})
         data = res.get_json()
         self.assertEqual(data['count'], 2)
         self.assertEqual(data['names'][0]['slot'], 2)
@@ -86,8 +100,9 @@ class TestAppAPI(unittest.TestCase):
         self.assertIsNotNone(data['user_booking'])
         self.assertEqual(data['user_booking']['slot'], 2)
 
-        # 8. Test validation: Empty name
+        # 9. Test validation: Empty or 1-letter name (anti-spam)
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.3'},
                                data=json.dumps({'name': '   ', 'slot': 3, 'deviceId': 'dev-3'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 400)
@@ -95,32 +110,46 @@ class TestAppAPI(unittest.TestCase):
         self.assertFalse(data['success'])
         self.assertIn('error', data)
 
-        # 9. Test validation: Invalid slot numbers (< 1 or > 15)
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.3'},
+                               data=json.dumps({'name': 'а', 'slot': 3, 'deviceId': 'dev-3'}), 
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+        data = res.get_json()
+        self.assertFalse(data['success'])
+        self.assertIn('минимум 2 символа', data['error'])
+
+        # 10. Test validation: Invalid slot numbers (< 1 or > 15)
+        res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.3'},
                                data=json.dumps({'name': 'Тест', 'slot': 0, 'deviceId': 'dev-3'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 400)
 
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.3'},
                                data=json.dumps({'name': 'Тест', 'slot': 16, 'deviceId': 'dev-3'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 400)
 
-        # 10. Test form-encoded submission
-        res = self.client.post('/api/names', data={'name': 'Дмитрий', 'slot': '15', 'deviceId': 'dev-3'})
+        # 11. Test form-encoded submission (Device 3, IP 10.0.0.3)
+        res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.3'},
+                               data={'name': 'Дмитрий', 'slot': '15', 'deviceId': 'dev-3'})
         self.assertEqual(res.status_code, 201)
         data = res.get_json()
         self.assertEqual(data['item']['slot'], 15)
         self.assertEqual(data['item']['name'], 'Дмитрий')
 
-        # 11. Count is now 3
+        # 12. Count is now 3
         res = self.client.get('/api/names')
         data = res.get_json()
         self.assertEqual(data['count'], 3)
         self.assertEqual([n['slot'] for n in data['names']], [2, 5, 15])
 
-        # 12. Cancel booking: Device 1 cancels slot 5
+        # 13. Cancel booking: Device 1 cancels slot 5
         res = self.client.post('/api/names/cancel', 
+                               headers={'X-Forwarded-For': '10.0.0.1'},
                                data=json.dumps({'deviceId': 'dev-1'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 200)
@@ -128,8 +157,9 @@ class TestAppAPI(unittest.TestCase):
         self.assertTrue(data['success'])
         self.assertEqual(data['freed_slot'], 5)
 
-        # Now slot 5 is free, and Device 1 can book another slot (e.g. slot 1)
+        # Now slot 5 is free, and Device 1 (IP 10.0.0.1) can book another slot (e.g. slot 1)
         res = self.client.post('/api/names', 
+                               headers={'X-Forwarded-For': '10.0.0.1'},
                                data=json.dumps({'name': 'Алексей', 'slot': 1, 'deviceId': 'dev-1'}), 
                                content_type='application/json')
         self.assertEqual(res.status_code, 201)
