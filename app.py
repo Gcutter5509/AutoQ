@@ -44,10 +44,20 @@ def init_db():
         conn = get_db()
         try:
             with conn:
+                # Check existing table schema
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(names)")
+                cols = [row[1] for row in cur.fetchall()]
+                # If table exists but lacks slot or device_id, drop and recreate
+                if cols and ('slot' not in cols or 'device_id' not in cols):
+                    conn.execute("DROP TABLE names")
+                
                 conn.execute('''
                     CREATE TABLE IF NOT EXISTS names (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        slot INTEGER NOT NULL UNIQUE CHECK(slot >= 1 AND slot <= 15),
                         name TEXT NOT NULL,
+                        device_id TEXT NOT NULL UNIQUE,
                         created_at TEXT NOT NULL
                     )
                 ''')
@@ -58,7 +68,6 @@ def init_db():
                     )
                 ''')
                 # Initialize last_cleanup_slot if not set
-                cur = conn.cursor()
                 cur.execute("SELECT value FROM system_meta WHERE key = 'last_cleanup_slot'")
                 if cur.fetchone() is None:
                     now = datetime.now(UTC5)
@@ -128,6 +137,19 @@ def scheduler_worker():
             print(f"Error in cleanup scheduler: {e}")
         time.sleep(5)
 
+def get_device_id():
+    """Extract device ID from request headers, JSON body, query params or cookies."""
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        if data.get('deviceId'):
+            return str(data.get('deviceId')).strip()
+    return (
+        request.headers.get('X-Device-Id') or
+        request.args.get('deviceId') or
+        request.cookies.get('autoq_device_id') or
+        ''
+    ).strip()
+
 @app.before_request
 def before_request_hook():
     """Ensure cleanup is up-to-date on every request."""
@@ -141,28 +163,42 @@ def index():
 def get_names():
     now = datetime.now(UTC5)
     next_slot = get_next_cleanup_slot(now)
+    device_id = get_device_id()
     
     with db_lock:
         conn = get_db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT id, name, created_at FROM names ORDER BY id ASC")
+            cur.execute("SELECT id, slot, name, device_id, created_at FROM names ORDER BY slot ASC")
             rows = cur.fetchall()
-            names_list = [
-                {
+            names_list = []
+            user_booking = None
+            for row in rows:
+                is_mine = bool(device_id and row["device_id"] == device_id)
+                item = {
                     "id": row["id"],
+                    "slot": row["slot"],
                     "name": row["name"],
-                    "created_at": row["created_at"]
+                    "created_at": row["created_at"],
+                    "is_mine": is_mine
                 }
-                for row in rows
-            ]
+                names_list.append(item)
+                if is_mine:
+                    user_booking = {
+                        "id": row["id"],
+                        "slot": row["slot"],
+                        "name": row["name"],
+                        "created_at": row["created_at"]
+                    }
         finally:
             conn.close()
             
     return jsonify({
         "success": True,
         "count": len(names_list),
+        "max_slots": 15,
         "names": names_list,
+        "user_booking": user_booking,
         "server_time": now.strftime('%Y-%m-%d %H:%M:%S (UTC+5)'),
         "next_cleanup": {
             "iso": next_slot.isoformat(),
@@ -175,12 +211,27 @@ def add_name():
     # Supports JSON payload or standard form data
     data = request.get_json(silent=True) or request.form
     name = (data.get('name') or '').strip()
+    slot_raw = data.get('slot')
+    device_id = (data.get('deviceId') or request.headers.get('X-Device-Id') or request.cookies.get('autoq_device_id') or '').strip()
     
     if not name:
         return jsonify({"success": False, "error": "Имя не может быть пустым"}), 400
     if len(name) > 100:
         return jsonify({"success": False, "error": "Имя слишком длинное (максимум 100 символов)"}), 400
         
+    if slot_raw is None or slot_raw == '':
+        return jsonify({"success": False, "error": "Не выбрано место в очереди (1–15)"}), 400
+
+    try:
+        slot = int(slot_raw)
+        if slot < 1 or slot > 15:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({"success": False, "error": "Номер места должен быть целым числом от 1 до 15"}), 400
+
+    if not device_id:
+        return jsonify({"success": False, "error": "Не удалось определить устройство (отсутствует deviceId)"}), 400
+
     now = datetime.now(UTC5)
     created_at_str = now.strftime('%d.%m.%Y %H:%M:%S')
     
@@ -189,8 +240,36 @@ def add_name():
         try:
             with conn:
                 cur = conn.cursor()
-                cur.execute("INSERT INTO names (name, created_at) VALUES (?, ?)", (name, created_at_str))
-                inserted_id = cur.lastrowid
+                # 1. Device check: only one spot per device
+                cur.execute("SELECT slot, name FROM names WHERE device_id = ?", (device_id,))
+                existing_dev = cur.fetchone()
+                if existing_dev:
+                    return jsonify({
+                        "success": False,
+                        "error": f"С вашего устройства уже забронировано место №{existing_dev['slot']} ({existing_dev['name']}). Одно устройство может занять только одно место!"
+                    }), 409
+
+                # 2. Slot check: is this slot available?
+                cur.execute("SELECT name FROM names WHERE slot = ?", (slot,))
+                existing_slot = cur.fetchone()
+                if existing_slot:
+                    return jsonify({
+                        "success": False,
+                        "error": f"Место №{slot} уже занято ({existing_slot['name']}). Пожалуйста, выберите другое свободное место."
+                    }), 409
+
+                # 3. Insert new booking
+                try:
+                    cur.execute(
+                        "INSERT INTO names (slot, name, device_id, created_at) VALUES (?, ?, ?, ?)",
+                        (slot, name, device_id, created_at_str)
+                    )
+                    inserted_id = cur.lastrowid
+                except sqlite3.IntegrityError:
+                    return jsonify({
+                        "success": False,
+                        "error": "Не удалось занять место: возможно, оно только что было занято другим участником."
+                    }), 409
         finally:
             conn.close()
             
@@ -198,10 +277,41 @@ def add_name():
         "success": True,
         "item": {
             "id": inserted_id,
+            "slot": slot,
             "name": name,
-            "created_at": created_at_str
+            "created_at": created_at_str,
+            "is_mine": True
         }
     }), 201
+
+@app.route('/api/names/cancel', methods=['POST'])
+def cancel_booking():
+    data = request.get_json(silent=True) or request.form
+    device_id = (data.get('deviceId') or request.headers.get('X-Device-Id') or request.cookies.get('autoq_device_id') or '').strip()
+
+    if not device_id:
+        return jsonify({"success": False, "error": "Не передан идентификатор устройства"}), 400
+
+    with db_lock:
+        conn = get_db()
+        try:
+            with conn:
+                cur = conn.cursor()
+                cur.execute("SELECT slot, name FROM names WHERE device_id = ?", (device_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"success": False, "error": "У вас нет активной записи в очереди"}), 404
+                
+                slot_freed = row["slot"]
+                conn.execute("DELETE FROM names WHERE device_id = ?", (device_id,))
+        finally:
+            conn.close()
+
+    return jsonify({
+        "success": True,
+        "message": f"Место №{slot_freed} успешно освобождено",
+        "freed_slot": slot_freed
+    })
 
 @app.route('/api/admin/clear', methods=['POST'])
 def manual_clear():

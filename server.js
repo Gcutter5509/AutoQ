@@ -128,12 +128,34 @@ async function performCleanupIfDue() {
   return false;
 }
 
+// Helper to extract device ID
+function getDeviceId(req) {
+  return String(
+    req.body?.deviceId ||
+    req.headers['x-device-id'] ||
+    req.query?.deviceId ||
+    ''
+  ).trim();
+}
+
 // Initialize tables and metadata
 async function initDb() {
+  try {
+    const tableInfo = await db.execute("PRAGMA table_info(names)");
+    const cols = tableInfo.rows.map(r => String(r.name ?? r[1] ?? ''));
+    if (cols.length > 0 && (!cols.includes('slot') || !cols.includes('device_id'))) {
+      await db.execute("DROP TABLE names");
+    }
+  } catch {
+    // Table may not exist yet, ignore
+  }
+
   await db.execute(`
     CREATE TABLE IF NOT EXISTS names (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      slot INTEGER NOT NULL UNIQUE CHECK(slot >= 1 AND slot <= 15),
       name TEXT NOT NULL,
+      device_id TEXT NOT NULL UNIQUE,
       created_at TEXT NOT NULL
     );
   `);
@@ -171,13 +193,30 @@ app.get('/api/names', async (req, res) => {
     await performCleanupIfDue();
     const nowUtc5 = getUtc5Date();
     const nextSlot = getNextCleanupSlot(nowUtc5);
+    const deviceId = getDeviceId(req);
 
-    const result = await db.execute('SELECT id, name, created_at FROM names ORDER BY id ASC');
-    const names = result.rows.map(row => ({
-      id: Number(row.id),
-      name: String(row.name),
-      created_at: String(row.created_at)
-    }));
+    const result = await db.execute('SELECT id, slot, name, device_id, created_at FROM names ORDER BY slot ASC');
+    let userBooking = null;
+    const names = result.rows.map(row => {
+      const rowDeviceId = String(row.device_id ?? '');
+      const isMine = Boolean(deviceId && rowDeviceId === deviceId);
+      const item = {
+        id: Number(row.id),
+        slot: Number(row.slot),
+        name: String(row.name),
+        created_at: String(row.created_at),
+        is_mine: isMine
+      };
+      if (isMine) {
+        userBooking = {
+          id: item.id,
+          slot: item.slot,
+          name: item.name,
+          created_at: item.created_at
+        };
+      }
+      return item;
+    });
 
     const yyyy = nowUtc5.getUTCFullYear();
     const MM = String(nowUtc5.getUTCMonth() + 1).padStart(2, '0');
@@ -190,7 +229,9 @@ app.get('/api/names', async (req, res) => {
     res.json({
       success: true,
       count: names.length,
+      max_slots: 15,
       names: names,
+      user_booking: userBooking,
       server_time: serverTime,
       next_cleanup: {
         iso: nextSlot.toISOString(),
@@ -206,12 +247,27 @@ app.get('/api/names', async (req, res) => {
 // 2. Add name to queue
 app.post('/api/names', async (req, res) => {
   const name = (req.body?.name || '').trim();
+  const slotRaw = req.body?.slot;
+  const deviceId = getDeviceId(req);
 
   if (!name) {
     return res.status(400).json({ success: false, error: 'Имя не может быть пустым' });
   }
   if (name.length > 100) {
     return res.status(400).json({ success: false, error: 'Имя слишком длинное (максимум 100 символов)' });
+  }
+
+  if (slotRaw === undefined || slotRaw === null || slotRaw === '') {
+    return res.status(400).json({ success: false, error: 'Не выбрано место в очереди (1–15)' });
+  }
+
+  const slot = parseInt(slotRaw, 10);
+  if (isNaN(slot) || slot < 1 || slot > 15) {
+    return res.status(400).json({ success: false, error: 'Номер места должен быть целым числом от 1 до 15' });
+  }
+
+  if (!deviceId) {
+    return res.status(400).json({ success: false, error: 'Не удалось определить устройство (отсутствует deviceId)' });
   }
 
   const nowUtc5 = getUtc5Date();
@@ -224,9 +280,37 @@ app.post('/api/names', async (req, res) => {
   const createdAtStr = `${dd}.${mm}.${yyyy} ${hh}:${min}:${ss}`;
 
   try {
+    // 1. Device check
+    const existingDev = await db.execute({
+      sql: 'SELECT slot, name FROM names WHERE device_id = ?',
+      args: [deviceId]
+    });
+    if (existingDev.rows.length > 0) {
+      const devSlot = existingDev.rows[0].slot ?? existingDev.rows[0][0];
+      const devName = existingDev.rows[0].name ?? existingDev.rows[0][1];
+      return res.status(409).json({
+        success: false,
+        error: `С вашего устройства уже забронировано место №${devSlot} (${devName}). Одно устройство может занять только одно место!`
+      });
+    }
+
+    // 2. Slot check
+    const existingSlot = await db.execute({
+      sql: 'SELECT name FROM names WHERE slot = ?',
+      args: [slot]
+    });
+    if (existingSlot.rows.length > 0) {
+      const slotOccupant = existingSlot.rows[0].name ?? existingSlot.rows[0][0];
+      return res.status(409).json({
+        success: false,
+        error: `Место №${slot} уже занято (${slotOccupant}). Пожалуйста, выберите другое свободное место.`
+      });
+    }
+
+    // 3. Insert
     const result = await db.execute({
-      sql: 'INSERT INTO names (name, created_at) VALUES (?, ?)',
-      args: [name, createdAtStr]
+      sql: 'INSERT INTO names (slot, name, device_id, created_at) VALUES (?, ?, ?, ?)',
+      args: [slot, name, deviceId, createdAtStr]
     });
 
     const insertedId = result.lastInsertRowid !== undefined ? Number(result.lastInsertRowid) : null;
@@ -235,17 +319,55 @@ app.post('/api/names', async (req, res) => {
       success: true,
       item: {
         id: insertedId,
+        slot: slot,
         name: name,
-        created_at: createdAtStr
+        created_at: createdAtStr,
+        is_mine: true
       }
     });
   } catch (err) {
     console.error('Error inserting name:', err);
+    res.status(409).json({
+      success: false,
+      error: 'Не удалось занять место: возможно, оно только что было занято другим участником.'
+    });
+  }
+});
+
+// 3. Cancel own booking endpoint
+app.post('/api/names/cancel', async (req, res) => {
+  const deviceId = getDeviceId(req);
+  if (!deviceId) {
+    return res.status(400).json({ success: false, error: 'Не передан идентификатор устройства' });
+  }
+
+  try {
+    const existing = await db.execute({
+      sql: 'SELECT slot, name FROM names WHERE device_id = ?',
+      args: [deviceId]
+    });
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'У вас нет активной записи в очереди' });
+    }
+
+    const slotFreed = existing.rows[0].slot ?? existing.rows[0][0];
+    await db.execute({
+      sql: 'DELETE FROM names WHERE device_id = ?',
+      args: [deviceId]
+    });
+
+    res.json({
+      success: true,
+      message: `Место №${slotFreed} успешно освобождено`,
+      freed_slot: Number(slotFreed)
+    });
+  } catch (err) {
+    console.error('Error cancelling booking:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 3. Manual reset endpoint
+// 4. Manual reset endpoint
 app.post('/api/admin/clear', async (req, res) => {
   const nowUtc5 = getUtc5Date();
   try {
