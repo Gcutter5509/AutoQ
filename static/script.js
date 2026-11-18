@@ -323,7 +323,7 @@
                 throw new Error(result.error || 'Не удалось занять выбранное место');
             }
 
-            showFeedback(`🎉 Вы успешно заняли место №${slotNumber}!`, 'success');
+            showFeedback(`Вы успешно заняли место №${slotNumber}`, 'success');
             await fetchNames();
         } catch (err) {
             showFeedback(err.message || 'Ошибка при отправке запроса', 'error');
